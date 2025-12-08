@@ -11,6 +11,9 @@ from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from torchvision import transforms
 import torch.optim as optim
 
+from sklearn.metrics import roc_auc_score, roc_curve, classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sns  # Confusion Matrix görselleştirmesi için (opsiyonel ama önerilir)
 
 # ============================
 # 1) Dataset / DataLoader
@@ -141,6 +144,40 @@ def project_to_sphere(z, z_adv, R, eps):
     return z_proj
 
 
+def estimate_radius(
+    model: nn.Module, 
+    data_loader: DataLoader, 
+    device: str = "cuda", 
+    num_batches: int = 10
+) -> float:
+    """
+    Eğitimden önce verinin embedding uzayındaki ortalama normunu hesaplar.
+    Bu, R (yarıçap) parametresini başlatmak için kullanılır.
+    """
+    model.eval()
+    norms = []
+    
+    print(f"[*] Radius (R) tahmini yapılıyor ({num_batches} batch)...")
+    
+    with torch.no_grad():
+        for i, (x, _) in enumerate(data_loader):
+            if i >= num_batches:
+                break
+            x = x.to(device)
+            # Modelden z (embedding) alıyoruz
+            z, _ = model(x) 
+            
+            # Her bir örneğin L2 normunu hesapla
+            batch_norms = torch.norm(z, p=2, dim=1)
+            norms.append(batch_norms)
+    
+    # Tüm normların ortalamasını al
+    all_norms = torch.cat(norms)
+    avg_radius = all_norms.mean().item()
+    
+    print(f"[*] Tahmin edilen R: {avg_radius:.4f}")
+    return avg_radius
+
 def drocc_loss(
     model: LeNet5DROCC,
     x: torch.Tensor,
@@ -196,15 +233,35 @@ def train_drocc(
     train_loader: DataLoader,
     device: str = "cuda",
     epochs: int = 10,
-    R: float = 1.0,
+    R: Optional[float] = None,  # None ise otomatik hesapla
     eps: float = 0.25,
     n_steps: int = 5,
-    step_size: float = 0.03,
+    step_size: Optional[float] = None, # None ise R'ye göre ayarla
     lambda_adv: float = 1.0,
     lr: float = 1e-3,
 ):
     model = LeNet5DROCC().to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr)
+
+    # --- OTOMATİK R VE STEP_SIZE AYARI ---
+    if R is None:
+        # Modeli başlatıp bir radius tahmini yapalım
+        # Not: İlk başta rastgele ağırlıklarla radius çok farklı olabilir,
+        # bu yüzden DROCC genelde pretrained bir model üzerine kurulur 
+        # veya ilk epoch'ta R dinamik güncellenir. 
+        # Burada basitlik adına başlangıçta bir kez ölçüyoruz.
+        R = estimate_radius(model, train_loader, device=device)
+    
+    # R çok küçükse (0'a yakınsa) patlamayı önlemek için alt sınır koyalım
+    if R < 0.1: 
+        R = 0.1
+        print("[!] R değeri çok küçük, 0.1'e sabitlendi.")
+
+    if step_size is None:
+        # Makale genelde step_size'ı radius'un küçük bir yüzdesi seçer
+        step_size = R * 0.05  # Örnek: Yarıçapın %5'i kadar adım at
+        print(f"[*] Step size otomatik ayarlandı: {step_size:.4f}")
+    # -------------------------------------
 
     model.train()
     for epoch in range(1, epochs + 1):
@@ -217,6 +274,8 @@ def train_drocc(
             x = x.to(device)
 
             optimizer.zero_grad()
+            
+            # drocc_loss fonksiyonu artık hesaplanan R ve step_size ile çağrılıyor
             loss, lp, ln = drocc_loss(
                 model, x,
                 R=R, eps=eps,
@@ -235,7 +294,7 @@ def train_drocc(
         avg_loss = total_loss / num_batches
         avg_pos = total_pos / num_batches
         avg_neg = total_neg / num_batches
-        print(f"Epoch {epoch:03d} | loss={avg_loss:.4f} | pos={avg_pos:.4f} | neg={avg_neg:.4f}")
+        print(f"Epoch {epoch:03d} | loss={avg_loss:.4f} | pos={avg_pos:.4f} | neg={avg_neg:.4f} | R={R:.2f}")
 
     return model
 
@@ -292,31 +351,119 @@ if __name__ == "__main__":
 
     # 2) Modeli DROCC ile eğit
     model = train_drocc(
-        train_loader,
+    train_loader,
         device=device,
         epochs=10,
-        R=1.0,
+        R=None,          # <--- Otomatik hesaplanacak
         eps=0.25,
         n_steps=5,
-        step_size=0.03,
+        step_size=None,  # <--- R'ye göre otomatik ayarlanacak
         lambda_adv=1.0,
         lr=1e-3,
     )
 
     # 3) İstersen basit test: normal + attack skorları topla
     if os.path.isdir(test_normal_dir) and os.path.isdir(test_attack_dir):
-        test_normal = PacketImageDataset(test_normal_dir, label=1, img_size=img_size)
-        test_attack = PacketImageDataset(test_attack_dir, label=0, img_size=img_size)
-        test_dataset = ConcatDataset([test_normal, test_attack])
-        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
-
-        scores, labels = evaluate_scores(model, test_loader, device=device)
-
-        # Örnek: Eşik belirlemeden sadece istatistikleri yazdır
-        print("Normal skor ort:", scores[labels == 1].mean())
-        print("Attack skor ort:", scores[labels == 0].mean())
 
         # İstersen buraya ROC-AUC için sklearn ekleyebilirsin:
         # from sklearn.metrics import roc_auc_score
         # auc = roc_auc_score(labels, scores)
         # print("ROC-AUC:", auc)
+
+        # ... (Yukarıdaki eğitim kodları aynen kalacak) ...
+
+        # 3) DETAYLI TEST VE METRİKLER
+        print("\n" + "="*40)
+        print("TEST AŞAMASI")
+        print("="*40)
+
+        if os.path.isdir(test_normal_dir) and os.path.isdir(test_attack_dir):
+            # Test veri setlerini hazırla
+            test_normal = PacketImageDataset(test_normal_dir, label=1, img_size=img_size) # Normal=1
+            test_attack = PacketImageDataset(test_attack_dir, label=0, img_size=img_size) # Attack=0
+            
+            test_dataset = ConcatDataset([test_normal, test_attack])
+            test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+            
+            print(f"Test Seti Boyutu: {len(test_dataset)} (Normal: {len(test_normal)}, Attack: {len(test_attack)})")
+
+            # Skorları al
+            scores, labels = evaluate_scores(model, test_loader, device=device)
+
+            # ---------------------------------------------------------
+            # A) ROC-AUC Hesaplama
+            # ---------------------------------------------------------
+            # Labels: 1 (Normal), 0 (Attack)
+            # Scores: Modelin 'normallik' skoru (yüksekse normal, düşükse anomali)
+            roc_auc = roc_auc_score(labels, scores)
+            print(f"\n[RESULT] ROC-AUC Score: {roc_auc:.4f}")
+
+            # ---------------------------------------------------------
+            # B) En İyi Eşik Değerini (Best Threshold) Bulma
+            # ---------------------------------------------------------
+            fpr, tpr, thresholds = roc_curve(labels, scores)
+            # Youden's J istatistiği: J = TPR - FPR
+            # En yüksek J değerini veren threshold en idealidir.
+            J = tpr - fpr
+            ix = np.argmax(J)
+            best_thresh = thresholds[ix]
+            print(f"[INFO] Best Threshold (Youden's J): {best_thresh:.4f}")
+
+            # ---------------------------------------------------------
+            # C) Confusion Matrix ve Sınıflandırma Raporu
+            # ---------------------------------------------------------
+            # Skoru threshold'a göre 0 veya 1'e çevir
+            preds = (scores >= best_thresh).astype(int)
+
+            print("\n--- Sınıflandırma Raporu ---")
+            # target_names: 0 -> Attack, 1 -> Normal
+            print(classification_report(labels, preds, target_names=['Attack', 'Normal']))
+
+            cm = confusion_matrix(labels, preds)
+            print("--- Confusion Matrix ---")
+            print(cm)
+            
+            # Confusion Matrix Görselleştirmesi
+            plt.figure(figsize=(6, 5))
+            # Eğer seaborn yüklü değilse 'pip install seaborn' yapın veya
+            # sadece plt.imshow(cm) kullanın. Aşağıdaki seaborn örneğidir:
+            try:
+                import seaborn as sns
+                sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                            xticklabels=['Attack (0)', 'Normal (1)'], 
+                            yticklabels=['Attack (0)', 'Normal (1)'])
+                plt.ylabel('Gerçek Etiket')
+                plt.xlabel('Tahmin Edilen Etiket')
+                plt.title('Confusion Matrix')
+                plt.savefig("confusion_matrix.png")
+                print("[GRAPH] Confusion Matrix kaydedildi: confusion_matrix.png")
+            except ImportError:
+                print("[!] Seaborn yüklü değil, CM görseli çizilmedi.")
+            
+            # ROC çizimi (Mevcut kodunuzdaki plt kodu buraya gelecek...)
+            print("(Sol Üst: TN (Attack), Sağ Üst: FP, Sol Alt: FN, Sağ Alt: TP (Normal))")
+
+            # ---------------------------------------------------------
+            # D) ROC Eğrisi Çizdirme (Tez Görseli)
+            # ---------------------------------------------------------
+            plt.figure(figsize=(8, 6))
+            plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (area = {roc_auc:.4f})')
+            plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+            plt.xlim([0.0, 1.0])
+            plt.ylim([0.0, 1.05])
+            plt.xlabel('False Positive Rate (Attack as Normal)')
+            plt.ylabel('True Positive Rate (Normal Detection)')
+            plt.title('ROC Curve for DROCC Anomaly Detection')
+            plt.legend(loc="lower right")
+            plt.grid(True)
+            
+            # Grafiği kaydet
+            save_path = "roc_curve_result.png"
+            plt.savefig(save_path)
+            print(f"\n[GRAPH] ROC Eğrisi kaydedildi: {save_path}")
+            plt.show()
+
+        else:
+            print("[!] Test klasörleri bulunamadı, test atlanıyor.")
+
+
