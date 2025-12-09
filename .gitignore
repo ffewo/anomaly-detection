@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# PCAP files (büyük dosyalar - isteğe bağlı olarak ekleyebilirsiniz)
+# *.pcap
+
+# Generated images (isteğe bağlı - eğer çok fazla görüntü varsa)
+# pcap_images/
+
+# Model checkpoints
+*.pth
+*.pt
+*.ckpt
+
+# Data directories (isteğe bağlı)
+# data/
+
+# OS
+.DS_Store
+Thumbs.db
+
