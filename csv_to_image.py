@@ -24,7 +24,7 @@ OUTPUT_DIR_TEST_ATTACK = "data/test/attack"     # Test için saldırı imgeleri
 
 N_PCA_COMPONENTS = 32          # Makaledeki gibi 32 bileşen
 WINDOW_SIZE = 32               # 32 ardışık satır → 32x32 görüntü
-STRIDE = 1                     # Kaydırma adımı (1 = her satırda yeni pencere)
+STRIDE = 16                     # Kaydırma adımı (1 = her satırda yeni pencere)
 
 IMG_HEIGHT = 32
 IMG_WIDTH = 32
