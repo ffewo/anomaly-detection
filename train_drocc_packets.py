@@ -1,8 +1,10 @@
 import os
-from typing import Optional, Tuple
+import argparse
+from typing import Optional, Tuple, List
 
 import numpy as np
 from PIL import Image
+import matplotlib.pyplot as plt
 
 import torch
 import torch.nn as nn
@@ -12,44 +14,44 @@ from torchvision import transforms
 import torch.optim as optim
 
 from sklearn.metrics import roc_auc_score, roc_curve, classification_report, confusion_matrix
-import matplotlib.pyplot as plt
-import seaborn as sns  # Confusion Matrix görselleştirmesi için (opsiyonel ama önerilir)
+
+# İlerleme çubuğu (Opsiyonel ama Input Space yavaş olduğu için önerilir)
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable, desc=""): return iterable
 
 # ============================
-# 1) Dataset / DataLoader
+# 1) Dataset & DataLoader
 # ============================
 
 class PacketImageDataset(Dataset):
     """
-    Klasördeki PNG (veya JPG) paket görüntülerini okur.
-    Tek kanallı (1 x 32 x 32) tensör ve sabit bir label döndürür.
-    DROCC için eğitimde label aslında kullanılmıyor (normal = 1).
+    32x32 Grayscale PNG görüntülerini okur ve Tensör'e çevirir.
     """
-    def __init__(self, root_dir: str, label: int = 1, img_size: int = 32):
-        """
-        :param root_dir: Görüntülerin bulunduğu klasör (ör: data/train/normal)
-        :param label: Bu klasörün etiketi (normal=1, attack=0 vb.)
-        :param img_size: LeNet için hedef boyut (32 önerilir)
-        """
+    def __init__(self, root_dir: str, label: int, img_size: int = 32):
         self.root_dir = root_dir
         self.label = label
         self.img_size = img_size
+        
+        if not os.path.exists(root_dir):
+            raise RuntimeError(f"Klasör bulunamadı: {root_dir}")
 
-        exts = (".png", ".jpg", ".jpeg", ".bmp")
+        exts = (".png", ".jpg", ".jpeg")
         self.files = [
-            os.path.join(root_dir, f)
-            for f in os.listdir(root_dir)
+            os.path.join(root_dir, f) for f in os.listdir(root_dir) 
             if f.lower().endswith(exts)
         ]
         self.files.sort()
 
         if len(self.files) == 0:
-            raise RuntimeError(f"{root_dir} içinde hiç görüntü bulunamadı.")
+            print(f"[UYARI] '{root_dir}' içinde görüntü yok!")
 
+        # 32x32, Grayscale, 0-1 arası Tensor
         self.transform = transforms.Compose([
-            transforms.Grayscale(num_output_channels=1),   # tek kanal
-            transforms.Resize((img_size, img_size)),       # 32x32
-            transforms.ToTensor(),                         # [0,1], shape: (1,H,W)
+            transforms.Grayscale(num_output_channels=1),
+            transforms.Resize((img_size, img_size)),
+            transforms.ToTensor(),
         ])
 
     def __len__(self) -> int:
@@ -57,413 +59,368 @@ class PacketImageDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
         img_path = self.files[idx]
-        img = Image.open(img_path)
-        img = self.transform(img)  # (1, img_size, img_size)
-        label = self.label
-        return img, label
+        try:
+            img = Image.open(img_path)
+            img = self.transform(img)
+            return img, self.label
+        except Exception as e:
+            # Bozuk dosya varsa siyah resim dön (Kodu kırmamak için)
+            print(f"Hata: {img_path} okunamadı -> {e}")
+            return torch.zeros((1, self.img_size, self.img_size)), self.label
 
 
 # ============================
-# 2) LeNet-5 Backbone + DROCC
+# 2) LeNet-5 Modeli
 # ============================
-
-class LeNet5Backbone(nn.Module):
-    """
-    LeNet-5'in embedding (F6) katmanına kadar olan kısmı.
-    Girdi: (B,1,32,32)
-    Çıkış: (B,84)
-    """
-    def __init__(self):
-        super().__init__()
-        # C1: 1x32x32 -> 6x28x28
-        self.conv1 = nn.Conv2d(1, 6, kernel_size=5)
-        # C3: 6x14x14 -> 16x10x10
-        self.conv2 = nn.Conv2d(6, 16, kernel_size=5)
-        # C5: 16x5x5 -> 120x1x1
-        self.conv3 = nn.Conv2d(16, 120, kernel_size=5)
-        # F6: 120 -> 84
-        self.fc1 = nn.Linear(120, 84)
-
-    def forward(self, x):
-        x = torch.tanh(self.conv1(x))
-        x = F.avg_pool2d(x, 2)                 # 6x14x14
-        x = torch.tanh(self.conv2(x))
-        x = F.avg_pool2d(x, 2)                 # 16x5x5
-        x = torch.tanh(self.conv3(x))          # 120x1x1
-        x = x.view(x.size(0), -1)              # (B,120)
-        x = torch.tanh(self.fc1(x))            # (B,84)
-        return x                               # embedding z
-
-
-class DROCCHead(nn.Module):
-    """
-    Embedding (z) üzerine tek-sınıf / binary classifier.
-    DROCC'de pozitif sınıf 'normal', adversarial negatifler 'anomali'.
-    """
-    def __init__(self, emb_dim: int = 84):
-        super().__init__()
-        self.fc = nn.Linear(emb_dim, 1)  # logit
-
-    def forward(self, z):
-        logit = self.fc(z)   # (B,1)
-        return logit.squeeze(-1)  # (B,)
-
 
 class LeNet5DROCC(nn.Module):
     """
-    Backbone + DROCC head birleşik model.
+    LeNet-5 Backbone + Tek Çıkışlı (One-Class) Head
+    Giriş: (Batch, 1, 32, 32)
+    Çıkış: (Batch, 1) -> Logit Değeri
     """
     def __init__(self):
         super().__init__()
-        self.backbone = LeNet5Backbone()
-        self.head = DROCCHead(emb_dim=84)
+        # Feature Extractor (Backbone)
+        self.conv1 = nn.Conv2d(1, 6, kernel_size=5)
+        self.conv2 = nn.Conv2d(6, 16, kernel_size=5)
+        self.conv3 = nn.Conv2d(16, 120, kernel_size=5)
+        
+        # Classifier (Head)
+        # 120 -> 84 -> 1 (Logit)
+        self.fc1 = nn.Linear(120, 84)
+        self.fc2 = nn.Linear(84, 1) # DROCC tek bir skor üretir
 
     def forward(self, x):
-        z = self.backbone(x)
-        logit = self.head(z)
-        return z, logit
+        # C1 -> Pool
+        x = torch.tanh(self.conv1(x))
+        x = F.avg_pool2d(x, 2)
+        # C2 -> Pool
+        x = torch.tanh(self.conv2(x))
+        x = F.avg_pool2d(x, 2)
+        # C3
+        x = torch.tanh(self.conv3(x))
+        
+        # Flatten (Batch, 120)
+        x = x.view(x.size(0), -1)
+        
+        # F6 (Embedding)
+        emb = torch.tanh(self.fc1(x))
+        
+        # Output (Logit)
+        logit = self.fc2(emb)
+        
+        return logit.squeeze(-1)
 
 
 # ============================
-# 3) DROCC Loss Fonksiyonu
+# 3) Input Space DROCC Fonksiyonları
 # ============================
 
-def project_to_sphere(z, z_adv, R, eps):
+def project_input_to_sphere(x, x_adv, R, eps=0.25):
     """
-    z etrafında R ile (1+eps)*R arasında halka (sphere shell) içine projeksiyon.
-    z_adv: başlangıç pertürbe edilmiş embedding
+    Adversarial örneği (x_adv), orijinal örneğin (x) etrafındaki
+    R ve (1+eps)R yarıçaplı halkanın içine çeker (Projection).
     """
-    diff = z_adv - z
-    dist = diff.norm(p=2, dim=1, keepdim=True) + 1e-8
-
+    # Piksel farkları
+    diff = x_adv - x
+    # Norm hesabı için düzleştir (Batch, 1024)
+    diff_flat = diff.view(diff.size(0), -1)
+    
+    # Euclidean Norm (Mesafe)
+    dist = diff_flat.norm(p=2, dim=1, keepdim=True) + 1e-8
+    
+    # Halka sınırları
     lower = R
     upper = (1.0 + eps) * R
-
+    
+    # Scale faktörü (Eğer mesafe halkanın dışındaysa içine çeker)
     scale = torch.clamp(dist, min=lower, max=upper) / dist
-    z_proj = z + diff * scale
-    return z_proj
+    
+    # Boyut düzeltme (Batch, 1, 1, 1) broadcast için
+    scale = scale.view(*dist.shape, 1, 1)
+    
+    # x_adv güncelle
+    x_proj = x + diff * scale
+    
+    # Görüntü olduğu için [0, 1] aralığına sıkıştır (Clipping)
+    x_proj = torch.clamp(x_proj, 0.0, 1.0)
+    
+    return x_proj
 
 
-def estimate_radius(
-    model: nn.Module, 
-    data_loader: DataLoader, 
-    device: str = "cuda", 
-    num_batches: int = 10
-) -> float:
-    """
-    Eğitimden önce verinin embedding uzayındaki ortalama normunu hesaplar.
-    Bu, R (yarıçap) parametresini başlatmak için kullanılır.
-    """
-    model.eval()
-    norms = []
-    
-    print(f"[*] Radius (R) tahmini yapılıyor ({num_batches} batch)...")
-    
-    with torch.no_grad():
-        for i, (x, _) in enumerate(data_loader):
-            if i >= num_batches:
-                break
-            x = x.to(device)
-            # Modelden z (embedding) alıyoruz
-            z, _ = model(x) 
-            
-            # Her bir örneğin L2 normunu hesapla
-            batch_norms = torch.norm(z, p=2, dim=1)
-            norms.append(batch_norms)
-    
-    # Tüm normların ortalamasını al
-    all_norms = torch.cat(norms)
-    avg_radius = all_norms.mean().item()
-    
-    print(f"[*] Tahmin edilen R: {avg_radius:.4f}")
-    return avg_radius
-
-def drocc_loss(
-    model: LeNet5DROCC,
+def drocc_loss_input_space(
+    model: nn.Module,
     x: torch.Tensor,
-    R: float = 1.0,
+    R: float,
     eps: float = 0.25,
     n_steps: int = 5,
-    step_size: float = 0.03,
-    lambda_adv: float = 1.0,
-) -> Tuple[torch.Tensor, float, float]:
+    step_size: float = 0.05,
+    lambda_adv: float = 1.0
+):
     """
-    Sadeleştirilmiş DROCC loss.
-    - model: LeNet5DROCC
-    - x: sadece 'normal' veriler (one-class)
+    Girdi uzayında (Input Space) adversarial negatif üreterek loss hesaplar.
     """
     device = x.device
     batch_size = x.size(0)
-
-    # 1) Normal embedding ve logit
-    z, logit_pos = model(x)
-    y_pos = torch.ones(batch_size, device=device)
-
-    # 2) Adversarial negatif embedding üret
-    z_adv = z + 0.1 * torch.randn_like(z)
-    z_adv = project_to_sphere(z, z_adv, R, eps)
-    z_adv.requires_grad_(True)
-
-    for _ in range(n_steps):
-        logit_adv = model.head(z_adv)
-        y_fake = torch.ones(batch_size, device=device)
-        loss_adv = F.binary_cross_entropy_with_logits(logit_adv, y_fake)
-        grad = torch.autograd.grad(loss_adv, z_adv)[0]
-        z_adv = z_adv + step_size * grad
-        z_adv = project_to_sphere(z, z_adv, R, eps)
-        z_adv = z_adv.detach()
-        z_adv.requires_grad_(True)
-
-    z_adv = z_adv.detach()
-    logit_neg = model.head(z_adv)
-    y_neg = torch.zeros(batch_size, device=device)
-
-    loss_pos = F.binary_cross_entropy_with_logits(logit_pos, y_pos)
-    loss_neg = F.binary_cross_entropy_with_logits(logit_neg, y_neg)
-
-    loss = loss_pos + lambda_adv * loss_neg
-    return loss, loss_pos.item(), loss_neg.item()
-
-
-# ============================
-# 4) Eğitim Döngüsü
-# ============================
-
-def train_drocc(
-    train_loader: DataLoader,
-    device: str = "cuda",
-    epochs: int = 10,
-    R: Optional[float] = None,  # None ise otomatik hesapla
-    eps: float = 0.25,
-    n_steps: int = 5,
-    step_size: Optional[float] = None, # None ise R'ye göre ayarla
-    lambda_adv: float = 1.0,
-    lr: float = 1e-3,
-):
-    model = LeNet5DROCC().to(device)
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-
-    # --- OTOMATİK R VE STEP_SIZE AYARI ---
-    if R is None:
-        # Modeli başlatıp bir radius tahmini yapalım
-        # Not: İlk başta rastgele ağırlıklarla radius çok farklı olabilir,
-        # bu yüzden DROCC genelde pretrained bir model üzerine kurulur 
-        # veya ilk epoch'ta R dinamik güncellenir. 
-        # Burada basitlik adına başlangıçta bir kez ölçüyoruz.
-        R = estimate_radius(model, train_loader, device=device)
     
-    # R çok küçükse (0'a yakınsa) patlamayı önlemek için alt sınır koyalım
-    if R < 0.1: 
-        R = 0.1
-        print("[!] R değeri çok küçük, 0.1'e sabitlendi.")
-
-    if step_size is None:
-        # Makale genelde step_size'ı radius'un küçük bir yüzdesi seçer
-        step_size = R * 0.05  # Örnek: Yarıçapın %5'i kadar adım at
-        print(f"[*] Step size otomatik ayarlandı: {step_size:.4f}")
-    # -------------------------------------
-
+    # --- 1) Pozitif (Normal) Loss ---
+    logit_pos = model(x)
+    # Normallerin etiketi 1'dir
+    y_pos = torch.ones(batch_size, device=device)
+    loss_pos = F.binary_cross_entropy_with_logits(logit_pos, y_pos)
+    
+    # --- 2) Negatif (Attack) Üretimi ---
+    # Gradient Ascent için modeli eval moduna al (BatchNorm vs. etkilenmesin)
+    model.eval()
+    
+    # x'in kopyasını al ve rastgele gürültü ekle
+    x_adv = x.detach().clone()
+    x_adv = x_adv + torch.randn_like(x_adv) * 0.01 
+    
+    # İlk projeksiyon (R mesafesine at)
+    x_adv = project_input_to_sphere(x, x_adv, R, eps)
+    x_adv.requires_grad_(True)
+    
+    # Döngü: Modeli "Normal" dedirtmeye zorlayarak en zor örneği bul
+    for _ in range(n_steps):
+        logit_adv = model(x_adv)
+        
+        # Hedef: Model buna 1 (Normal) desin ki, biz tersine (anomaliye) itelim
+        loss_search = F.binary_cross_entropy_with_logits(logit_adv, y_pos)
+        
+        # Piksellere göre türev al
+        grad = torch.autograd.grad(loss_search, x_adv)[0]
+        
+        # Gradient Ascent (Zor örneğe doğru git) - FGSM mantığı (sign)
+        x_adv = x_adv + step_size * torch.sign(grad)
+        
+        # Tekrar manifoldun (halkanın) içine çek
+        x_adv = project_input_to_sphere(x, x_adv, R, eps)
+        
+        # Döngü hazırlığı
+        x_adv = x_adv.detach()
+        x_adv.requires_grad_(True)
+        
+    # --- 3) Negatif (Attack) Loss ---
+    # Eğitime geri dön
     model.train()
+    
+    x_adv = x_adv.detach() # Artık x_adv sabit
+    logit_neg = model(x_adv)
+    
+    # Negatiflerin etiketi 0'dır
+    y_neg = torch.zeros(batch_size, device=device)
+    loss_neg = F.binary_cross_entropy_with_logits(logit_neg, y_neg)
+    
+    # Toplam Loss
+    total_loss = loss_pos + lambda_adv * loss_neg
+    
+    return total_loss, loss_pos.item(), loss_neg.item()
+
+
+def estimate_radius_input_space(data_loader, device="cuda"):
+    """
+    Veri setindeki rastgele görüntü çiftleri arasındaki ortalama mesafeyi hesaplar.
+    Bu, R (Radius) parametresini başlatmak için iyi bir yöntemdir.
+    """
+    print("[*] Radius (R) tahmini yapılıyor...")
+    distances = []
+    
+    # Sadece ilk 5 batch yeterli
+    for i, (x, _) in enumerate(data_loader):
+        if i > 5: break
+        x = x.to(device)
+        B = x.size(0)
+        if B < 2: continue
+        
+        # Flatten
+        x_flat = x.view(B, -1)
+        
+        # Batch içindeki her elemanın ortalamaya olan uzaklığı
+        center = x_flat.mean(dim=0, keepdim=True)
+        dist = torch.norm(x_flat - center, p=2, dim=1)
+        distances.append(dist)
+        
+    all_dists = torch.cat(distances)
+    # Ortalama mesafenin biraz fazlası güvenli bir R değeridir
+    estimated_R = all_dists.mean().item() * 1.5
+    print(f"[*] Tahmin edilen R: {estimated_R:.4f}")
+    return estimated_R
+
+
+# ============================
+# 4) Eğitim ve Test Döngüleri
+# ============================
+
+def train_model(
+    model, train_loader, device, 
+    epochs=10, R=None, lr=1e-3
+):
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    
+    # R verilmediyse tahmin et
+    if R is None:
+        R = estimate_radius_input_space(train_loader, device)
+    
+    # Step size genelde R'nin küçük bir yüzdesidir
+    step_size = R * 0.1 
+    
+    print(f"[*] Eğitim Başlıyor... (Epochs: {epochs}, R: {R:.2f}, Step: {step_size:.2f})")
+    
     for epoch in range(1, epochs + 1):
-        total_loss = 0.0
-        total_pos = 0.0
-        total_neg = 0.0
-        num_batches = 0
-
-        for x, _ in train_loader:
+        model.train()
+        total_loss = 0
+        total_pos = 0
+        total_neg = 0
+        
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}")
+        
+        for x, _ in pbar:
             x = x.to(device)
-
             optimizer.zero_grad()
             
-            # drocc_loss fonksiyonu artık hesaplanan R ve step_size ile çağrılıyor
-            loss, lp, ln = drocc_loss(
-                model, x,
-                R=R, eps=eps,
-                n_steps=n_steps,
-                step_size=step_size,
-                lambda_adv=lambda_adv,
+            # Input Space Loss
+            loss, lp, ln = drocc_loss_input_space(
+                model, x, R=R, n_steps=5, step_size=step_size
             )
+            
             loss.backward()
             optimizer.step()
-
+            
             total_loss += loss.item()
             total_pos += lp
             total_neg += ln
-            num_batches += 1
-
-        avg_loss = total_loss / num_batches
-        avg_pos = total_pos / num_batches
-        avg_neg = total_neg / num_batches
-        print(f"Epoch {epoch:03d} | loss={avg_loss:.4f} | pos={avg_pos:.4f} | neg={avg_neg:.4f} | R={R:.2f}")
-
+            
+            pbar.set_postfix({"Loss": f"{loss.item():.3f}", "L_Pos": f"{lp:.3f}", "L_Neg": f"{ln:.3f}"})
+            
+        print(f"Epoch {epoch} Bitti -> Avg Loss: {total_loss/len(train_loader):.4f}")
+        
     return model
 
 
-# ============================
-# 5) Basit Test / Skor Hesabı
-# ============================
-
 @torch.no_grad()
-def evaluate_scores(model: LeNet5DROCC, data_loader: DataLoader, device: str = "cuda"):
+def evaluate(model, test_loader, device):
     model.eval()
     scores = []
     labels = []
-
-    for x, y in data_loader:
+    
+    print("[*] Test Ediliyor...")
+    for x, y in tqdm(test_loader, desc="Test"):
         x = x.to(device)
-        y = y.to(device)
-        _, logit = model(x)
+        logit = model(x)
+        # Sigmoid ile 0-1 arasına çek (Olasılık)
         prob = torch.sigmoid(logit)
-        scores.append(prob.cpu().numpy())
-        labels.append(y.cpu().numpy())
-
-    scores = np.concatenate(scores, axis=0)
-    labels = np.concatenate(labels, axis=0)
-    return scores, labels
+        
+        scores.extend(prob.cpu().numpy())
+        labels.extend(y.numpy())
+        
+    return np.array(scores), np.array(labels)
 
 
 # ============================
-# 6) main
+# 5) Main
 # ============================
 
 if __name__ == "__main__":
-    # -------------------------
-    # KLASÖR YAPISI ÖRNEĞİ:
-    # data/
-    #   train/
-    #     normal/   -> sadece normal paketlerden üretilmiş PNG'ler
-    #   test/
-    #     normal/   -> test için normal
-    #     attack/   -> test için saldırı
-    # -------------------------
+    
+    # --- AYARLAR ---
+    # PCAP veya CSV kodundan gelen çıktı klasörlerini buraya yazın:
+    TRAIN_NORMAL_DIR = "data/train/normal"
+    TEST_NORMAL_DIR = "data/test/normal"
+    TEST_ATTACK_DIR = "data/test/attack"
+    
+    BATCH_SIZE = 64
+    EPOCHS = 10
+    LR = 1e-3
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    print(f"Cihaz: {DEVICE}")
+    
+    # 1. Veri Yükleme
+    # Eğer klasörler yoksa hata vermemesi için kontrol edelim
+    if not os.path.exists(TRAIN_NORMAL_DIR):
+        print(f"HATA: {TRAIN_NORMAL_DIR} bulunamadı! Lütfen yolu düzeltin.")
+        exit()
 
-    train_normal_dir = "pcap_images/Normal"
-    test_normal_dir = "pcap_images/Normal"  # Test için ayrı klasör oluşturulabilir
-    test_attack_dir = "pcap_images/Attack"  # Attack klasörü oluşturulmalı
-
-    batch_size = 64
-    img_size = 32
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    # 1) Eğitim datası: sadece normal
-    train_dataset = PacketImageDataset(train_normal_dir, label=1, img_size=img_size)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
-
-    # 2) Modeli DROCC ile eğit
-    model = train_drocc(
-    train_loader,
-        device=device,
-        epochs=10,
-        R=None,          # <--- Otomatik hesaplanacak
-        eps=0.25,
-        n_steps=5,
-        step_size=None,  # <--- R'ye göre otomatik ayarlanacak
-        lambda_adv=1.0,
-        lr=1e-3,
+    train_ds = PacketImageDataset(TRAIN_NORMAL_DIR, label=1) # Normal=1
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+    
+    # 2. Model Kurulumu
+    model = LeNet5DROCC().to(DEVICE)
+    
+    # 3. Eğitim (Input Space)
+    model = train_model(
+        model, train_loader, device=DEVICE, 
+        epochs=EPOCHS, lr=LR, R=None # R'yi otomatik bulur
     )
-
-    # 3) İstersen basit test: normal + attack skorları topla
-    if os.path.isdir(test_normal_dir) and os.path.isdir(test_attack_dir):
-
-        # İstersen buraya ROC-AUC için sklearn ekleyebilirsin:
-        # from sklearn.metrics import roc_auc_score
-        # auc = roc_auc_score(labels, scores)
-        # print("ROC-AUC:", auc)
-
-        # ... (Yukarıdaki eğitim kodları aynen kalacak) ...
-
-        # 3) DETAYLI TEST VE METRİKLER
-        print("\n" + "="*40)
-        print("TEST AŞAMASI")
-        print("="*40)
-
-        if os.path.isdir(test_normal_dir) and os.path.isdir(test_attack_dir):
-            # Test veri setlerini hazırla
-            test_normal = PacketImageDataset(test_normal_dir, label=1, img_size=img_size) # Normal=1
-            test_attack = PacketImageDataset(test_attack_dir, label=0, img_size=img_size) # Attack=0
-            
-            test_dataset = ConcatDataset([test_normal, test_attack])
-            test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
-            
-            print(f"Test Seti Boyutu: {len(test_dataset)} (Normal: {len(test_normal)}, Attack: {len(test_attack)})")
-
-            # Skorları al
-            scores, labels = evaluate_scores(model, test_loader, device=device)
-
-            # ---------------------------------------------------------
-            # A) ROC-AUC Hesaplama
-            # ---------------------------------------------------------
-            # Labels: 1 (Normal), 0 (Attack)
-            # Scores: Modelin 'normallik' skoru (yüksekse normal, düşükse anomali)
-            roc_auc = roc_auc_score(labels, scores)
-            print(f"\n[RESULT] ROC-AUC Score: {roc_auc:.4f}")
-
-            # ---------------------------------------------------------
-            # B) En İyi Eşik Değerini (Best Threshold) Bulma
-            # ---------------------------------------------------------
-            fpr, tpr, thresholds = roc_curve(labels, scores)
-            # Youden's J istatistiği: J = TPR - FPR
-            # En yüksek J değerini veren threshold en idealidir.
-            J = tpr - fpr
-            ix = np.argmax(J)
-            best_thresh = thresholds[ix]
-            print(f"[INFO] Best Threshold (Youden's J): {best_thresh:.4f}")
-
-            # ---------------------------------------------------------
-            # C) Confusion Matrix ve Sınıflandırma Raporu
-            # ---------------------------------------------------------
-            # Skoru threshold'a göre 0 veya 1'e çevir
-            preds = (scores >= best_thresh).astype(int)
-
-            print("\n--- Sınıflandırma Raporu ---")
-            # target_names: 0 -> Attack, 1 -> Normal
-            print(classification_report(labels, preds, target_names=['Attack', 'Normal']))
-
-            cm = confusion_matrix(labels, preds)
-            print("--- Confusion Matrix ---")
-            print(cm)
-            
-            # Confusion Matrix Görselleştirmesi
-            plt.figure(figsize=(6, 5))
-            # Eğer seaborn yüklü değilse 'pip install seaborn' yapın veya
-            # sadece plt.imshow(cm) kullanın. Aşağıdaki seaborn örneğidir:
-            try:
-                import seaborn as sns
-                sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
-                            xticklabels=['Attack (0)', 'Normal (1)'], 
-                            yticklabels=['Attack (0)', 'Normal (1)'])
-                plt.ylabel('Gerçek Etiket')
-                plt.xlabel('Tahmin Edilen Etiket')
-                plt.title('Confusion Matrix')
-                plt.savefig("confusion_matrix.png")
-                print("[GRAPH] Confusion Matrix kaydedildi: confusion_matrix.png")
-            except ImportError:
-                print("[!] Seaborn yüklü değil, CM görseli çizilmedi.")
-            
-            # ROC çizimi (Mevcut kodunuzdaki plt kodu buraya gelecek...)
-            print("(Sol Üst: TN (Attack), Sağ Üst: FP, Sol Alt: FN, Sağ Alt: TP (Normal))")
-
-            # ---------------------------------------------------------
-            # D) ROC Eğrisi Çizdirme (Tez Görseli)
-            # ---------------------------------------------------------
-            plt.figure(figsize=(8, 6))
-            plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (area = {roc_auc:.4f})')
-            plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
-            plt.xlim([0.0, 1.0])
-            plt.ylim([0.0, 1.05])
-            plt.xlabel('False Positive Rate (Attack as Normal)')
-            plt.ylabel('True Positive Rate (Normal Detection)')
-            plt.title('ROC Curve for DROCC Anomaly Detection')
-            plt.legend(loc="lower right")
-            plt.grid(True)
-            
-            # Grafiği kaydet
-            save_path = "roc_curve_result.png"
-            plt.savefig(save_path)
-            print(f"\n[GRAPH] ROC Eğrisi kaydedildi: {save_path}")
-            plt.show()
-
-        else:
-            print("[!] Test klasörleri bulunamadı, test atlanıyor.")
-
-
+    
+    # 4. Test Hazırlığı
+    if os.path.exists(TEST_NORMAL_DIR) and os.path.exists(TEST_ATTACK_DIR):
+        test_norm_ds = PacketImageDataset(TEST_NORMAL_DIR, label=1) # Normal=1
+        test_att_ds = PacketImageDataset(TEST_ATTACK_DIR, label=0)  # Attack=0
+        
+        test_ds = ConcatDataset([test_norm_ds, test_att_ds])
+        test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False)
+        
+        print(f"\nTest Seti: {len(test_norm_ds)} Normal, {len(test_att_ds)} Saldırı.")
+        
+        # 5. Değerlendirme
+        scores, labels = evaluate(model, test_loader, DEVICE)
+        
+        # ROC-AUC
+        auc = roc_auc_score(labels, scores)
+        print(f"\n[SONUÇ] ROC-AUC Score: {auc:.4f}")
+        
+        # Best Threshold (Youden's J)
+        fpr, tpr, thresholds = roc_curve(labels, scores)
+        J = tpr - fpr
+        best_idx = np.argmax(J)
+        best_thresh = thresholds[best_idx]
+        print(f"[BİLGİ] En iyi Eşik Değeri (Threshold): {best_thresh:.4f}")
+        
+        # Tahminler (0 veya 1)
+        preds = (scores >= best_thresh).astype(int)
+        
+        # Rapor
+        print("\n--- Sınıflandırma Raporu ---")
+        print(classification_report(labels, preds, target_names=["Saldırı (0)", "Normal (1)"]))
+        
+        # Confusion Matrix
+        cm = confusion_matrix(labels, preds)
+        
+        # Görselleştirme
+        plt.figure(figsize=(10, 4))
+        
+        # 1. Grafik: Confusion Matrix
+        plt.subplot(1, 2, 1)
+        try:
+            import seaborn as sns
+            sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+                        xticklabels=["Saldırı", "Normal"],
+                        yticklabels=["Saldırı", "Normal"])
+        except ImportError:
+            plt.imshow(cm, cmap="Blues")
+            plt.text(0,0, str(cm[0,0]), color="red") # Basit fallback
+        plt.title("Confusion Matrix")
+        plt.xlabel("Tahmin")
+        plt.ylabel("Gerçek")
+        
+        # 2. Grafik: ROC Curve
+        plt.subplot(1, 2, 2)
+        plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'AUC = {auc:.2f}')
+        plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+        plt.xlim([0.0, 1.0])
+        plt.ylim([0.0, 1.05])
+        plt.xlabel('False Positive Rate')
+        plt.ylabel('True Positive Rate')
+        plt.title('ROC Eğrisi')
+        plt.legend(loc="lower right")
+        
+        plt.tight_layout()
+        plt.savefig("drocc_sonuclar.png")
+        print("[KAYIT] Grafikler 'drocc_sonuclar.png' dosyasına kaydedildi.")
+        plt.show()
+        
+    else:
+        print("Test klasörleri eksik, test yapılmadı.")

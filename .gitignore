@@ -34,11 +34,13 @@ wheels/
 .ipynb_checkpoints
 
 # PCAP files (büyük dosyalar - isteğe bağlı olarak ekleyebilirsiniz)
-# *.pcap
+*.pcap
+*.csv
+
 
 # Generated images (isteğe bağlı - eğer çok fazla görüntü varsa)
-# pcap_images/
-
+pcap_images/
+data/
 # Model checkpoints
 *.pth
 *.pt

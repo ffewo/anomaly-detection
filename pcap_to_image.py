@@ -1,5 +1,4 @@
 import os
-import math
 import argparse
 from typing import List, Optional
 
@@ -7,85 +6,79 @@ import numpy as np
 from scapy.all import PcapReader  # type: ignore
 from PIL import Image
 
+# Tqdm varsa kullan, yoksa boş geç
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable, desc=""):
+        return iterable
+
 
 # -------------------------------------------------------------------------
-# 1) PCAP'ten ham paket baytlarını oku
+# 1) PCAP Okuma
 # -------------------------------------------------------------------------
-def read_packet_bytes(
-    pcap_path: str,
-    max_packets: Optional[int] = None,
-) -> List[bytes]:
-    """
-    Verilen PCAP dosyasından ham paket baytlarını okur.
-    Her paket, PCAP içindeki tam frame (link layer + IP + TCP/UDP + payload) olarak alınır.
-    """
+def read_packet_bytes(pcap_path: str, max_packets: Optional[int] = None) -> List[bytes]:
     packets: List[bytes] = []
-
+    print(f"PCAP okunuyor: {pcap_path} ...")
     with PcapReader(pcap_path) as pcap:
-        for i, pkt in enumerate(pcap):
+        for i, pkt in enumerate(tqdm(pcap, desc="Paketler Yükleniyor")):
             if max_packets is not None and i >= max_packets:
                 break
             try:
                 packets.append(bytes(pkt))
             except Exception:
-                # Bozuk paket vs. varsa atla
                 continue
-
     return packets
 
 
 # -------------------------------------------------------------------------
-# 2) window_size paketlik pencereler -> tek byte dizisi
+# 2) Windowing (LeNet için optimize edilmiş Trimming)
 # -------------------------------------------------------------------------
 def window_packet_bytes(
     packets: List[bytes],
-    window_size: int = 32,
-    stride: Optional[int] = None,
+    window_size: int,
+    stride: int,
+    bytes_per_packet: int,
 ) -> List[bytes]:
     """
-    Paket listesini window_size paketlik pencerelere böler.
-    Her pencere için paketler concat edilip tek byte dizisi döner.
-
-    Örn:
-        window_size = 32, stride = 32  -> çakışmasız bloklar
-        window_size = 32, stride = 16  -> %50 overlap
-        window_size = 32, stride = 1   -> sliding window
+    Paketleri pencerelere böler ve hesaplanan limite göre kırpar.
     """
-    if stride is None:
-        stride = window_size
-
     n = len(packets)
     if n < window_size:
         return []
 
     windows: List[bytes] = []
+    # stride yoksa window_size kadar kaydır
+    actual_stride = stride if stride is not None else window_size
     last_start = n - window_size
-    for start in range(0, last_start + 1, stride):
+    
+    for start in range(0, last_start + 1, actual_stride):
         chunk = packets[start:start + window_size]
-        concat_bytes = b"".join(chunk)
+        
+        # LeNet için kritik nokta:
+        # Her paketin sadece hesaplanan 'bytes_per_packet' kadarını alıyoruz.
+        trimmed_chunk = [pkt[:bytes_per_packet] for pkt in chunk]
+        
+        concat_bytes = b"".join(trimmed_chunk)
         windows.append(concat_bytes)
 
     return windows
 
 
 # -------------------------------------------------------------------------
-# 3) Byte dizisinden sabit boyutlu görüntü matrisi (side x side)
+# 3) Byte -> Image (32x32 Sabit)
 # -------------------------------------------------------------------------
-def bytes_to_fixed_image_array(
+def bytes_to_lenet_image(
     data: bytes,
     side: int = 32,
     pad_value: int = 0,
 ) -> np.ndarray:
     """
-    Verilen byte dizisini (len(data)) sabit side x side boyutlu
-    uint8 bir görüntü matrisine çevirir.
-
-    - Eğer data, side*side byte'tan UZUNSA -> ilk side*side byte alınır (truncate).
-    - Eğer data KISAsa              -> kalan kısım pad_value ile doldurulur.
+    Veriyi 32x32 (veya belirtilen side) matrise dönüştürür.
     """
     total = side * side
-
     arr = np.frombuffer(data, dtype=np.uint8)
+    
     if arr.size >= total:
         arr = arr[:total]
     else:
@@ -98,131 +91,97 @@ def bytes_to_fixed_image_array(
 
 
 # -------------------------------------------------------------------------
-# 4) PCAP -> (num_windows, side, side) tensör
+# 4) Ana Akış
 # -------------------------------------------------------------------------
-def pcap_to_window_image_arrays(
+def pcap_to_lenet_ready_arrays(
     pcap_path: str,
     max_packets: Optional[int] = None,
-    window_size: int = 32,
-    stride: Optional[int] = 16,   # <-- VARSAYILAN STRIDE = 16
-    side: int = 32,
-    pad_value: int = 0,
+    window_size: int = 16,  # <-- LENET İÇİN VARSAYILAN 16 (Daha fazla paket sığmaz)
+    stride: Optional[int] = 8,
+    side: int = 32,         # <-- LENET STANDARD (32x32)
 ) -> np.ndarray:
-    """
-    PCAP dosyasını okuyup:
-        - Paketleri alır
-        - window_size paketlik pencerelere böler (stride varsayılan 16)
-        - Her pencereyi tek byte dizisine concat eder
-        - Her pencereyi side x side görüntüye çevirir
-
-    Dönüş:
-        X: np.ndarray, shape = (num_windows, side, side)
-    """
+    
+    # 1. Paketleri Oku
     packets = read_packet_bytes(pcap_path, max_packets=max_packets)
     if not packets:
-        raise ValueError("PCAP dosyasından paket okunamadı.")
+        raise ValueError("PCAP boş veya okunamadı.")
 
+    # 2. LeNet Kısıt Kontrolü ve Limit Hesabı
+    total_capacity = side * side  # 1024
+    calculated_limit = total_capacity // window_size
+    
+    print(f"\n--- LeNet Uyumluluk Kontrolü ---")
+    print(f"Giriş Boyutu    : {side}x{side} ({total_capacity} byte)")
+    print(f"Pencere Boyutu  : {window_size} paket")
+    print(f"Paket Başına    : {calculated_limit} byte ayrıldı.")
+
+    if calculated_limit < 54:
+        print("UYARI: Paket başına ayrılan alan < 54 byte.")
+        print("       TCP/UDP başlıkları ve port bilgileri kesilebilir!")
+        print("       ÖNERİ: --window_size parametresini düşürün (örn: 12 veya 16).")
+    else:
+        print("DURUM: İdeal. Headerlar ve payload başlangıcı sığıyor.")
+    print("--------------------------------\n")
+
+    # 3. Pencereleri Oluştur
     window_bytes_list = window_packet_bytes(
         packets,
         window_size=window_size,
         stride=stride,
+        bytes_per_packet=calculated_limit
     )
-    if not window_bytes_list:
-        raise ValueError(
-            f"Yeterli paket yok. Toplam paket: {len(packets)}, "
-            f"window_size: {window_size}"
-        )
 
+    if not window_bytes_list:
+        raise ValueError(f"Yeterli paket yok. ({len(packets)} < {window_size})")
+
+    # 4. Görüntüye Çevir
     num_windows = len(window_bytes_list)
     X = np.empty((num_windows, side, side), dtype=np.uint8)
 
     for i, wbytes in enumerate(window_bytes_list):
-        X[i] = bytes_to_fixed_image_array(
-            wbytes,
-            side=side,
-            pad_value=pad_value,
-        )
+        X[i] = bytes_to_lenet_image(wbytes, side=side)
 
     return X
 
 
-# -------------------------------------------------------------------------
-# 5) Görüntüleri diske kaydet
-# -------------------------------------------------------------------------
-def save_images_to_folder(
-    X: np.ndarray,
-    out_dir: str,
-    prefix: str = "win",
-) -> None:
-    """
-    X: (num_images, H, W) uint8 tensörü
-    Her görüntüyü grayscale PNG olarak kaydeder.
-    """
+def save_images(X: np.ndarray, out_dir: str):
     os.makedirs(out_dir, exist_ok=True)
-    num_images = X.shape[0]
-
-    for idx in range(num_images):
-        img_arr = X[idx]
-        img = Image.fromarray(img_arr, mode="L")
-        filename = f"{prefix}_{idx:06d}.png"
-        img.save(os.path.join(out_dir, filename))
+    print(f"Kayıt başladı: {out_dir}")
+    for idx in range(X.shape[0]):
+        img = Image.fromarray(X[idx], mode="L")
+        img.save(os.path.join(out_dir, f"image_{idx:06d}.png"))
 
 
 # -------------------------------------------------------------------------
-# 6) Komut satırı arayüzü
+# CLI
 # -------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(
-        description="PCAP'ten 32 paketlik pencerelerden görüntü üretme script'i (stride=16 varsayılan)"
-    )
-    parser.add_argument("pcap_path", type=str, help="Girdi PCAP dosyası")
-    parser.add_argument(
-        "--out_dir",
-        type=str,
-        default="pcap_windows_32pkt",
-        help="Çıktı klasörü (PNG'ler buraya kaydedilir)",
-    )
-    parser.add_argument(
-        "--window_size",
-        type=int,
-        default=32,
-        help="Her görüntüde kullanılacak paket sayısı (varsayılan 32)",
-    )
-    parser.add_argument(
-        "--stride",
-        type=int,
-        default=16,   # <-- KOMUT SATIRINDA DA VARSAYILAN 16
-        help="Pencere adımı (varsayılan 16)",
-    )
-    parser.add_argument(
-        "--side",
-        type=int,
-        default=32,
-        help="Görüntü boyutu (side x side, varsayılan 32x32)",
-    )
-    parser.add_argument(
-        "--max_packets",
-        type=int,
-        default=None,
-        help="İşlenecek maksimum paket sayısı (None -> hepsi)",
-    )
+    parser = argparse.ArgumentParser(description="PCAP -> LeNet (32x32) Dataset Generator")
+    parser.add_argument("pcap_path", type=str)
+    parser.add_argument("--out_dir", type=str, default="pcap_images")
+    
+    # LeNet için kritik varsayılanlar
+    parser.add_argument("--side", type=int, default=32, help="LeNet için 32 olmalı")
+    
+    # Window size 16 seçildi çünkü: 1024 / 16 = 64 byte. 
+    # Bu da TCP headerlarını kurtarmak için gereken minimum alandır.
+    parser.add_argument("--window_size", type=int, default=16, help="LeNet için 16 önerilir")
+    
+    parser.add_argument("--stride", type=int, default=8, help="Veri çoğaltmak için düşük tutulabilir")
+    parser.add_argument("--max_packets", type=int, default=None)
+
     args = parser.parse_args()
 
-    X = pcap_to_window_image_arrays(
+    X = pcap_to_lenet_ready_arrays(
         pcap_path=args.pcap_path,
         max_packets=args.max_packets,
         window_size=args.window_size,
-        stride=args.stride,   # burada 16 geliyor (override etmezsen)
-        side=args.side,
-        pad_value=0,
+        stride=args.stride,
+        side=args.side
     )
 
-    print(f"Üretilen pencere/görüntü sayısı: {X.shape[0]}")
-    print(f"Görüntü boyutu: {X.shape[1]} x {X.shape[2]}")
-
-    save_images_to_folder(X, out_dir=args.out_dir, prefix="win")
-    print(f"Görüntüler '{args.out_dir}' klasörüne kaydedildi.")
-
+    print(f"Üretilen Tensör: {X.shape}")
+    save_images(X, args.out_dir)
 
 if __name__ == "__main__":
     main()
