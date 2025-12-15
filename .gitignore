@@ -36,11 +36,13 @@ wheels/
 # PCAP files (büyük dosyalar - isteğe bağlı olarak ekleyebilirsiniz)
 *.pcap
 *.csv
+*.png
 
 
 # Generated images (isteğe bağlı - eğer çok fazla görüntü varsa)
 pcap_images/
 data/
+datasets/
 # Model checkpoints
 *.pth
 *.pt
